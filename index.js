@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
 const TelegramBot = require("node-telegram-bot-api");
+const { Pool } = require("pg");
 
 dotenv.config();
 
@@ -19,15 +20,16 @@ const ADMIN_ID = Number(process.env.ADMIN_ID);
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BOT_USERNAME = process.env.BOT_USERNAME;
 const VOTE_URL = process.env.VOTE_URL;
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const STORAGE_MODE = DATABASE_URL ? "postgres" : "file";
 
 if (!Number.isInteger(ADMIN_ID)) {
   throw new Error("ADMIN_ID must be a valid integer.");
 }
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
+const STATE_ROW_KEY = "main";
 
 const ADMIN_FLOW = {
   IDLE: "idle",
@@ -39,19 +41,8 @@ const ADMIN_FLOW = {
 const GIVEAWAY_STATUS = {
   NONE: "none",
   COLLECTING: "collecting",
-  VOTING: "voting",
-  FINISHED: "finished"
+  VOTING: "voting"
 };
-
-function ensureStorage() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  if (!fs.existsSync(STATE_FILE)) {
-    saveState(createDefaultState());
-  }
-}
 
 function createDefaultState() {
   return {
@@ -76,48 +67,107 @@ function createDefaultState() {
   };
 }
 
-function loadState() {
-  ensureStorage();
-  return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-}
+function sanitizeState(rawState) {
+  const defaultState = createDefaultState();
 
-function saveState(state) {
-  ensureStorage();
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-}
-
-let state = loadState();
-let finishVotingTimer = null;
-
-function resetAdminFlow() {
-  state.adminFlow = {
-    step: ADMIN_FLOW.IDLE,
-    draft: null
+  return {
+    adminFlow: {
+      ...defaultState.adminFlow,
+      ...(rawState && rawState.adminFlow ? rawState.adminFlow : {})
+    },
+    giveaway: {
+      ...defaultState.giveaway,
+      ...(rawState && rawState.giveaway ? rawState.giveaway : {})
+    }
   };
 }
 
-function resetGiveaway() {
-  state.giveaway = {
-    status: GIVEAWAY_STATUS.NONE,
-    createdAt: null,
-    endAtText: "",
-    pollEndAtText: "",
-    prizeStars: 0,
-    participantsLimit: 10,
-    participants: [],
-    announcementMessageId: null,
-    pollMessageId: null,
-    pollId: null,
-    pollOptions: [],
-    winner: null
-  };
-}
-
-function clearFinishVotingTimer() {
-  if (finishVotingTimer) {
-    clearTimeout(finishVotingTimer);
-    finishVotingTimer = null;
+function ensureFileStorage() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
   }
+
+  if (!fs.existsSync(STATE_FILE)) {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(createDefaultState(), null, 2));
+  }
+}
+
+function createStorage() {
+  if (STORAGE_MODE === "postgres") {
+    const pool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSL === "false" ? false : { rejectUnauthorized: false }
+    });
+
+    return {
+      mode: "postgres",
+      async init() {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS bot_state (
+            state_key TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+
+        await pool.query(
+          `
+            INSERT INTO bot_state (state_key, payload)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (state_key) DO NOTHING
+          `,
+          [STATE_ROW_KEY, JSON.stringify(createDefaultState())]
+        );
+      },
+      async load() {
+        const result = await pool.query(
+          "SELECT payload FROM bot_state WHERE state_key = $1 LIMIT 1",
+          [STATE_ROW_KEY]
+        );
+
+        if (!result.rows.length) {
+          const defaultState = createDefaultState();
+          await this.save(defaultState);
+          return defaultState;
+        }
+
+        return sanitizeState(result.rows[0].payload);
+      },
+      async save(state) {
+        await pool.query(
+          `
+            INSERT INTO bot_state (state_key, payload, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (state_key)
+            DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+          `,
+          [STATE_ROW_KEY, JSON.stringify(state)]
+        );
+      }
+    };
+  }
+
+  return {
+    mode: "file",
+    async init() {
+      ensureFileStorage();
+    },
+    async load() {
+      ensureFileStorage();
+      return sanitizeState(JSON.parse(fs.readFileSync(STATE_FILE, "utf8")));
+    },
+    async save(state) {
+      ensureFileStorage();
+      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    }
+  };
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function parseDateInput(value) {
@@ -151,44 +201,6 @@ function parseDateInput(value) {
   return date;
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function isAdmin(chatId) {
-  return Number(chatId) === ADMIN_ID;
-}
-
-function getAdminKeyboard() {
-  if (state.giveaway.status === GIVEAWAY_STATUS.COLLECTING) {
-    return {
-      reply_markup: {
-        inline_keyboard: [[{ text: "Запустить", callback_data: "admin_launch_vote" }]]
-      },
-      parse_mode: "HTML"
-    };
-  }
-
-  return {
-    reply_markup: {
-      inline_keyboard: [[{ text: "Создать розыгрыш", callback_data: "admin_create_giveaway" }]]
-    },
-    parse_mode: "HTML"
-  };
-}
-
-function getParticipantButton() {
-  return {
-    reply_markup: {
-      inline_keyboard: [[{ text: "Участвую", callback_data: "join_giveaway" }]]
-    },
-    parse_mode: "HTML"
-  };
-}
-
 function getParticipantTag(user) {
   if (user.username) {
     return `@${user.username}`;
@@ -203,497 +215,585 @@ function getMentionLink(user) {
   return `<a href="tg://user?id=${user.id}">${escapeHtml(title)}</a>`;
 }
 
-function buildAnnouncementText() {
-  return [
-    "<b>Дорогие друзья, объявляем новый розыгрыш!</b>",
-    "",
-    "<b>Количество мест:</b> 10",
-    `<b>Приз:</b> ${escapeHtml(state.giveaway.prizeStars)} ⭐`,
-    `<b>Завершение розыгрыша:</b> ${escapeHtml(state.giveaway.endAtText)}`,
-    "",
-    "Чтобы принять участие:",
-    `1. Перейдите в бота ${escapeHtml(BOT_USERNAME)}`,
-    "2. Нажмите <b>/start</b>",
-    "3. Нажмите кнопку <b>Участвую</b>",
-    "",
-    "<i>После набора 10 участников мы откроем голосование и объявим победителя.</i>"
-  ].join("\n");
-}
+async function main() {
+  const storage = createStorage();
+  await storage.init();
 
-function buildAdminDraftText(draft) {
-  return [
-    "<b>Проверь данные розыгрыша</b>",
-    "",
-    `<b>Когда завершится розыгрыш:</b> ${escapeHtml(draft.endAtText)}`,
-    `<b>Приз:</b> ${escapeHtml(draft.prizeStars)} ⭐`,
-    "",
-    "Если всё верно, подтверди запуск анонса."
-  ].join("\n");
-}
+  let state = await storage.load();
+  let finishVotingTimer = null;
 
-function buildVotingText(participants) {
-  const lines = [
-    "<b>Дорогие друзья, стартует голосование!</b>",
-    "",
-    "Ниже участники текущего розыгрыша. Вы можете проголосовать за того, кого хотите поддержать.",
-    "",
-    "<b>Участники:</b>"
-  ];
+  const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-  participants.forEach((participant, index) => {
-    lines.push(`${index + 1}. ${escapeHtml(participant.displayName)}`);
-  });
-
-  lines.push("");
-  lines.push(`Голосовать: <a href="${escapeHtml(VOTE_URL)}">${escapeHtml(VOTE_URL)}</a>`);
-  lines.push(`Бот: ${escapeHtml(BOT_USERNAME)}`);
-  lines.push(`<b>Администратор:</b> <code>${ADMIN_ID}</code>`);
-  lines.push(`<b>Окончание голосования:</b> ${escapeHtml(state.giveaway.endAtText)}`);
-
-  return lines.join("\n");
-}
-
-function buildWinnerText(winner) {
-  return [
-    "<b>Розыгрыш завершен!</b>",
-    "",
-    `<b>Победитель:</b> ${winner}`,
-    `<b>Приз:</b> ${escapeHtml(state.giveaway.prizeStars)} ⭐`,
-    "",
-    "Спасибо всем, кто участвовал и голосовал. Следите за новыми розыгрышами в канале."
-  ].join("\n");
-}
-
-function buildNoGiveawayText() {
-  return [
-    "🎁 <b>Сейчас активного набора нет.</b>",
-    "",
-    "Следите за нашим каналом. Как только стартует новый розыгрыш, мы сразу опубликуем объявление."
-  ].join("\n");
-}
-
-function buildCollectingText() {
-  return [
-    "✨ <b>Привет!</b>",
-    "",
-    "Хочешь участвовать в розыгрыше? Нажимай на кнопку ниже и занимай место среди участников."
-  ].join("\n");
-}
-
-function buildVotingStartedText() {
-  return [
-    "🗳 <b>Сейчас идет розыгрыш.</b>",
-    "",
-    "Набор уже завершен, а голосование запущено. Следите за результатами в канале."
-  ].join("\n");
-}
-
-function buildJoinedText() {
-  return [
-    "✅ <b>Заявка принята.</b>",
-    "",
-    "Ты нажал на кнопку участия. Я сообщу тебе, когда тебя добавят в голосование."
-  ].join("\n");
-}
-
-function buildAlreadyJoinedText() {
-  return [
-    "✅ <b>Ты уже в списке участников.</b>",
-    "",
-    "Дождись старта голосования, мы отдельно напишем тебе в личные сообщения."
-  ].join("\n");
-}
-
-async function sendAdminHome(chatId) {
-  return bot.sendMessage(
-    chatId,
-    "Привет, бро. Ниже кнопка для управления розыгрышем.",
-    getAdminKeyboard()
-  );
-}
-
-async function startGiveawayAnnouncement(chatId) {
-  state.giveaway.status = GIVEAWAY_STATUS.COLLECTING;
-  state.giveaway.createdAt = new Date().toISOString();
-  state.giveaway.endAtText = state.adminFlow.draft.endAtText;
-  state.giveaway.pollEndAtText = state.adminFlow.draft.endAtText;
-  state.giveaway.prizeStars = state.adminFlow.draft.prizeStars;
-  saveState(state);
-
-  const sent = await bot.sendMessage(CHANNEL_ID, buildAnnouncementText(), { parse_mode: "HTML" });
-  state.giveaway.announcementMessageId = sent.message_id;
-  resetAdminFlow();
-  saveState(state);
-
-  await bot.sendMessage(chatId, "Розыгрыш опубликован. Теперь идет набор участников.", getAdminKeyboard());
-}
-
-async function notifyParticipantsVotingStarted() {
-  const tasks = state.giveaway.participants.map((participant) =>
-    bot
-      .sendMessage(
-        participant.id,
-        [
-          "📢 <b>Ты участвуешь в розыгрыше.</b>",
-          "",
-          "Просим пока не менять свой username до завершения голосования, чтобы участникам было проще тебя узнать."
-        ].join("\n"),
-        { parse_mode: "HTML" }
-      )
-      .catch(() => null)
-  );
-
-  await Promise.all(tasks);
-}
-
-async function launchVoting(chatId) {
-  if (state.giveaway.status !== GIVEAWAY_STATUS.COLLECTING) {
-    await bot.sendMessage(chatId, "Сейчас нет активного набора, который можно запустить.");
-    return;
+  async function saveState() {
+    await storage.save(state);
   }
 
-  if (state.giveaway.participants.length < state.giveaway.participantsLimit) {
-    await bot.sendMessage(
-      chatId,
-      `Пока недостаточно участников. Сейчас: ${state.giveaway.participants.length}/${state.giveaway.participantsLimit}.`
-    );
-    return;
+  function isAdmin(chatId) {
+    return Number(chatId) === ADMIN_ID;
   }
 
-  const options = state.giveaway.participants.map((participant) => participant.pollLabel);
-  const pollText = buildVotingText(state.giveaway.participants);
-  const poll = await bot.sendPoll(CHANNEL_ID, "Выберите участника розыгрыша", options, {
-    is_anonymous: false,
-    allows_multiple_answers: false
-  });
+  function resetAdminFlow() {
+    state.adminFlow = {
+      step: ADMIN_FLOW.IDLE,
+      draft: null
+    };
+  }
 
-  await bot.sendMessage(CHANNEL_ID, pollText, { parse_mode: "HTML", disable_web_page_preview: true });
-  await notifyParticipantsVotingStarted();
+  function resetGiveaway() {
+    state.giveaway = {
+      status: GIVEAWAY_STATUS.NONE,
+      createdAt: null,
+      endAtText: "",
+      pollEndAtText: "",
+      prizeStars: 0,
+      participantsLimit: 10,
+      participants: [],
+      announcementMessageId: null,
+      pollMessageId: null,
+      pollId: null,
+      pollOptions: [],
+      winner: null
+    };
+  }
 
-  state.giveaway.status = GIVEAWAY_STATUS.VOTING;
-  state.giveaway.pollMessageId = poll.message_id;
-  state.giveaway.pollId = poll.poll.id;
-  state.giveaway.pollOptions = options;
-  saveState(state);
-  scheduleVotingFinish();
-
-  await bot.sendMessage(chatId, "Голосование запущено и опубликовано в канале.");
-}
-
-function getWinnerFromPoll(poll) {
-  let winnerIndex = 0;
-  let maxVotes = -1;
-
-  poll.options.forEach((option, index) => {
-    if (option.voter_count > maxVotes) {
-      maxVotes = option.voter_count;
-      winnerIndex = index;
+  function clearFinishVotingTimer() {
+    if (finishVotingTimer) {
+      clearTimeout(finishVotingTimer);
+      finishVotingTimer = null;
     }
-  });
-
-  return state.giveaway.participants[winnerIndex];
-}
-
-async function finalizeVotingResult(poll) {
-  if (
-    state.giveaway.status !== GIVEAWAY_STATUS.VOTING ||
-    !state.giveaway.pollId ||
-    poll.id !== state.giveaway.pollId
-  ) {
-    return;
   }
 
-  const winner = getWinnerFromPoll(poll);
-  if (!winner) {
-    return;
+  function getAdminKeyboard() {
+    if (state.giveaway.status === GIVEAWAY_STATUS.COLLECTING) {
+      return {
+        reply_markup: {
+          inline_keyboard: [[{ text: "Запустить", callback_data: "admin_launch_vote" }]]
+        },
+        parse_mode: "HTML"
+      };
+    }
+
+    return {
+      reply_markup: {
+        inline_keyboard: [[{ text: "Создать розыгрыш", callback_data: "admin_create_giveaway" }]]
+      },
+      parse_mode: "HTML"
+    };
   }
 
-  clearFinishVotingTimer();
+  function getParticipantButton() {
+    return {
+      reply_markup: {
+        inline_keyboard: [[{ text: "Участвую", callback_data: "join_giveaway" }]]
+      },
+      parse_mode: "HTML"
+    };
+  }
 
-  const winnerMention = getMentionLink(winner.user);
-  await bot.sendMessage(CHANNEL_ID, buildWinnerText(winnerMention), { parse_mode: "HTML" });
-
-  const adminKeyboard = {
-    inline_keyboard: [[{ text: "Открыть чат победителя", url: `tg://user?id=${winner.id}` }]]
-  };
-
-  await bot.sendMessage(
-    ADMIN_ID,
-    [
-      "<b>Розыгрыш завершен.</b>",
+  function buildAnnouncementText() {
+    return [
+      "<b>Дорогие друзья, объявляем новый розыгрыш!</b>",
       "",
-      `<b>Победитель:</b> ${winnerMention}`,
-      `<b>Голоса:</b> ${poll.options[winner.index].voter_count}`
-    ].join("\n"),
-    {
-      parse_mode: "HTML",
-      reply_markup: adminKeyboard
-    }
-  );
-
-  state.giveaway.status = GIVEAWAY_STATUS.FINISHED;
-  state.giveaway.winner = {
-    id: winner.id,
-    displayName: winner.displayName
-  };
-  saveState(state);
-
-  resetGiveaway();
-  saveState(state);
-}
-
-async function stopPollAndFinalize() {
-  if (state.giveaway.status !== GIVEAWAY_STATUS.VOTING || !state.giveaway.pollMessageId) {
-    return;
+      "<b>Количество мест:</b> 10",
+      `<b>Приз:</b> ${escapeHtml(state.giveaway.prizeStars)} ⭐`,
+      `<b>Завершение розыгрыша:</b> ${escapeHtml(state.giveaway.endAtText)}`,
+      "",
+      "Чтобы принять участие:",
+      `1. Перейдите в бота ${escapeHtml(BOT_USERNAME)}`,
+      "2. Нажмите <b>/start</b>",
+      "3. Нажмите кнопку <b>Участвую</b>",
+      "",
+      "<i>После набора 10 участников мы откроем голосование и объявим победителя.</i>"
+    ].join("\n");
   }
 
-  const poll = await bot.stopPoll(CHANNEL_ID, state.giveaway.pollMessageId).catch(() => null);
-  if (poll) {
-    await finalizeVotingResult(poll);
-  }
-}
-
-function scheduleVotingFinish() {
-  clearFinishVotingTimer();
-
-  if (state.giveaway.status !== GIVEAWAY_STATUS.VOTING) {
-    return;
+  function buildAdminDraftText(draft) {
+    return [
+      "<b>Проверь данные розыгрыша</b>",
+      "",
+      `<b>Когда завершится розыгрыш:</b> ${escapeHtml(draft.endAtText)}`,
+      `<b>Приз:</b> ${escapeHtml(draft.prizeStars)} ⭐`,
+      "",
+      "Если всё верно, подтверди запуск анонса."
+    ].join("\n");
   }
 
-  const finishAt = parseDateInput(state.giveaway.pollEndAtText);
-  if (!finishAt) {
-    return;
+  function buildVotingText(participants) {
+    const lines = [
+      "<b>Дорогие друзья, стартует голосование!</b>",
+      "",
+      "Ниже участники текущего розыгрыша. Вы можете проголосовать за того, кого хотите поддержать.",
+      "",
+      "<b>Участники:</b>"
+    ];
+
+    participants.forEach((participant, index) => {
+      lines.push(`${index + 1}. ${escapeHtml(participant.displayName)}`);
+    });
+
+    lines.push("");
+    lines.push(`Голосовать: <a href="${escapeHtml(VOTE_URL)}">${escapeHtml(VOTE_URL)}</a>`);
+    lines.push(`Бот: ${escapeHtml(BOT_USERNAME)}`);
+    lines.push(`<b>Администратор:</b> <code>${ADMIN_ID}</code>`);
+    lines.push(`<b>Окончание голосования:</b> ${escapeHtml(state.giveaway.endAtText)}`);
+
+    return lines.join("\n");
   }
 
-  const delay = finishAt.getTime() - Date.now();
-  if (delay <= 0) {
-    stopPollAndFinalize().catch(() => null);
-    return;
+  function buildWinnerText(winner) {
+    return [
+      "<b>Розыгрыш завершен!</b>",
+      "",
+      `<b>Победитель:</b> ${winner}`,
+      `<b>Приз:</b> ${escapeHtml(state.giveaway.prizeStars)} ⭐`,
+      "",
+      "Спасибо всем, кто участвовал и голосовал. Следите за новыми розыгрышами в канале."
+    ].join("\n");
   }
 
-  finishVotingTimer = setTimeout(() => {
-    stopPollAndFinalize().catch(() => null);
-  }, delay);
-}
+  function buildNoGiveawayText() {
+    return [
+      "🎁 <b>Сейчас активного набора нет.</b>",
+      "",
+      "Следите за нашим каналом. Как только стартует новый розыгрыш, мы сразу опубликуем объявление."
+    ].join("\n");
+  }
 
-async function handleAdminMessage(msg) {
-  const chatId = msg.chat.id;
-  const text = (msg.text || "").trim();
+  function buildCollectingText() {
+    return [
+      "✨ <b>Привет!</b>",
+      "",
+      "Хочешь участвовать в розыгрыше? Нажимай на кнопку ниже и занимай место среди участников."
+    ].join("\n");
+  }
 
-  if (text === "/start") {
+  function buildVotingStartedText() {
+    return [
+      "🗳 <b>Сейчас идет розыгрыш.</b>",
+      "",
+      "Набор уже завершен, а голосование запущено. Следите за результатами в канале."
+    ].join("\n");
+  }
+
+  function buildJoinedText() {
+    return [
+      "✅ <b>Заявка принята.</b>",
+      "",
+      "Ты нажал на кнопку участия. Я сообщу тебе, когда тебя добавят в голосование."
+    ].join("\n");
+  }
+
+  function buildAlreadyJoinedText() {
+    return [
+      "✅ <b>Ты уже в списке участников.</b>",
+      "",
+      "Дождись старта голосования, мы отдельно напишем тебе в личные сообщения."
+    ].join("\n");
+  }
+
+  async function sendAdminHome(chatId) {
+    return bot.sendMessage(
+      chatId,
+      "Привет, бро. Ниже кнопка для управления розыгрышем.",
+      getAdminKeyboard()
+    );
+  }
+
+  async function startGiveawayAnnouncement(chatId) {
+    state.giveaway.status = GIVEAWAY_STATUS.COLLECTING;
+    state.giveaway.createdAt = new Date().toISOString();
+    state.giveaway.endAtText = state.adminFlow.draft.endAtText;
+    state.giveaway.pollEndAtText = state.adminFlow.draft.endAtText;
+    state.giveaway.prizeStars = state.adminFlow.draft.prizeStars;
+    await saveState();
+
+    const sent = await bot.sendMessage(CHANNEL_ID, buildAnnouncementText(), { parse_mode: "HTML" });
+    state.giveaway.announcementMessageId = sent.message_id;
     resetAdminFlow();
-    saveState(state);
-    await sendAdminHome(chatId);
-    return;
+    await saveState();
+
+    await bot.sendMessage(chatId, "Розыгрыш опубликован. Теперь идет набор участников.", getAdminKeyboard());
   }
 
-  if (state.adminFlow.step === ADMIN_FLOW.WAIT_END_AT) {
-    const parsedDate = parseDateInput(text);
-    if (!parsedDate || parsedDate.getTime() <= Date.now()) {
+  async function notifyParticipantsVotingStarted() {
+    const tasks = state.giveaway.participants.map((participant) =>
+      bot
+        .sendMessage(
+          participant.id,
+          [
+            "📢 <b>Ты участвуешь в розыгрыше.</b>",
+            "",
+            "Просим пока не менять свой username до завершения голосования, чтобы участникам было проще тебя узнать."
+          ].join("\n"),
+          { parse_mode: "HTML" }
+        )
+        .catch(() => null)
+    );
+
+    await Promise.all(tasks);
+  }
+
+  function getWinnerFromPoll(poll) {
+    let winnerIndex = 0;
+    let maxVotes = -1;
+
+    poll.options.forEach((option, index) => {
+      if (option.voter_count > maxVotes) {
+        maxVotes = option.voter_count;
+        winnerIndex = index;
+      }
+    });
+
+    return state.giveaway.participants[winnerIndex];
+  }
+
+  async function finalizeVotingResult(poll) {
+    if (
+      state.giveaway.status !== GIVEAWAY_STATUS.VOTING ||
+      !state.giveaway.pollId ||
+      poll.id !== state.giveaway.pollId
+    ) {
+      return;
+    }
+
+    const winner = getWinnerFromPoll(poll);
+    if (!winner) {
+      return;
+    }
+
+    clearFinishVotingTimer();
+
+    const winnerMention = getMentionLink(winner.user);
+    await bot.sendMessage(CHANNEL_ID, buildWinnerText(winnerMention), { parse_mode: "HTML" });
+
+    await bot.sendMessage(
+      ADMIN_ID,
+      [
+        "<b>Розыгрыш завершен.</b>",
+        "",
+        `<b>Победитель:</b> ${winnerMention}`,
+        `<b>Голоса:</b> ${poll.options[winner.index].voter_count}`
+      ].join("\n"),
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[{ text: "Открыть чат победителя", url: `tg://user?id=${winner.id}` }]]
+        }
+      }
+    );
+
+    resetGiveaway();
+    await saveState();
+  }
+
+  async function stopPollAndFinalize() {
+    if (state.giveaway.status !== GIVEAWAY_STATUS.VOTING || !state.giveaway.pollMessageId) {
+      return;
+    }
+
+    const poll = await bot.stopPoll(CHANNEL_ID, state.giveaway.pollMessageId).catch(() => null);
+    if (poll) {
+      await finalizeVotingResult(poll);
+    }
+  }
+
+  function scheduleVotingFinish() {
+    clearFinishVotingTimer();
+
+    if (state.giveaway.status !== GIVEAWAY_STATUS.VOTING) {
+      return;
+    }
+
+    const finishAt = parseDateInput(state.giveaway.pollEndAtText);
+    if (!finishAt) {
+      return;
+    }
+
+    const delay = finishAt.getTime() - Date.now();
+    if (delay <= 0) {
+      stopPollAndFinalize().catch(() => null);
+      return;
+    }
+
+    finishVotingTimer = setTimeout(() => {
+      stopPollAndFinalize().catch(() => null);
+    }, delay);
+  }
+
+  async function launchVoting(chatId) {
+    if (state.giveaway.status !== GIVEAWAY_STATUS.COLLECTING) {
+      await bot.sendMessage(chatId, "Сейчас нет активного набора, который можно запустить.");
+      return;
+    }
+
+    if (state.giveaway.participants.length < state.giveaway.participantsLimit) {
       await bot.sendMessage(
         chatId,
-        "Отправь дату в формате `30.03.2026 20:00`, и она должна быть в будущем.",
-        { parse_mode: "Markdown" }
+        `Пока недостаточно участников. Сейчас: ${state.giveaway.participants.length}/${state.giveaway.participantsLimit}.`
       );
       return;
     }
 
-    state.adminFlow.step = ADMIN_FLOW.WAIT_PRIZE;
-    state.adminFlow.draft = { endAtText: text, prizeStars: 0 };
-    saveState(state);
-    await bot.sendMessage(chatId, "Напиши, на сколько звезд будет розыгрыш. Например: 500");
-    return;
+    const options = state.giveaway.participants.map((participant) => participant.pollLabel);
+    const poll = await bot.sendPoll(CHANNEL_ID, "Выберите участника розыгрыша", options, {
+      is_anonymous: false,
+      allows_multiple_answers: false
+    });
+
+    await bot.sendMessage(CHANNEL_ID, buildVotingText(state.giveaway.participants), {
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+    await notifyParticipantsVotingStarted();
+
+    state.giveaway.status = GIVEAWAY_STATUS.VOTING;
+    state.giveaway.pollMessageId = poll.message_id;
+    state.giveaway.pollId = poll.poll.id;
+    state.giveaway.pollOptions = options;
+    await saveState();
+    scheduleVotingFinish();
+
+    await bot.sendMessage(chatId, "Голосование запущено и опубликовано в канале.");
   }
 
-  if (state.adminFlow.step === ADMIN_FLOW.WAIT_PRIZE) {
-    const stars = Number(text.replace(/[^\d]/g, ""));
-    if (!Number.isFinite(stars) || stars <= 0) {
-      await bot.sendMessage(chatId, "Нужно отправить число звезд, например: 500");
+  async function handleAdminMessage(msg) {
+    const chatId = msg.chat.id;
+    const text = (msg.text || "").trim();
+
+    if (text === "/start") {
+      resetAdminFlow();
+      await saveState();
+      await sendAdminHome(chatId);
       return;
     }
 
-    state.adminFlow.step = ADMIN_FLOW.WAIT_CONFIRM;
-    state.adminFlow.draft.prizeStars = stars;
-    saveState(state);
+    if (state.adminFlow.step === ADMIN_FLOW.WAIT_END_AT) {
+      const parsedDate = parseDateInput(text);
+      if (!parsedDate || parsedDate.getTime() <= Date.now()) {
+        await bot.sendMessage(
+          chatId,
+          "Отправь дату в формате `30.03.2026 20:00`, и она должна быть в будущем.",
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
 
-    await bot.sendMessage(chatId, buildAdminDraftText(state.adminFlow.draft), {
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Подтвердить", callback_data: "admin_confirm_giveaway" }],
-          [{ text: "Отмена", callback_data: "admin_cancel_giveaway" }]
-        ]
+      state.adminFlow.step = ADMIN_FLOW.WAIT_PRIZE;
+      state.adminFlow.draft = { endAtText: text, prizeStars: 0 };
+      await saveState();
+      await bot.sendMessage(chatId, "Напиши, на сколько звезд будет розыгрыш. Например: 500");
+      return;
+    }
+
+    if (state.adminFlow.step === ADMIN_FLOW.WAIT_PRIZE) {
+      const stars = Number(text.replace(/[^\d]/g, ""));
+      if (!Number.isFinite(stars) || stars <= 0) {
+        await bot.sendMessage(chatId, "Нужно отправить число звезд, например: 500");
+        return;
+      }
+
+      state.adminFlow.step = ADMIN_FLOW.WAIT_CONFIRM;
+      state.adminFlow.draft.prizeStars = stars;
+      await saveState();
+
+      await bot.sendMessage(chatId, buildAdminDraftText(state.adminFlow.draft), {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "Подтвердить", callback_data: "admin_confirm_giveaway" }],
+            [{ text: "Отмена", callback_data: "admin_cancel_giveaway" }]
+          ]
+        }
+      });
+    }
+  }
+
+  async function handleUserStart(chatId) {
+    if (state.giveaway.status === GIVEAWAY_STATUS.COLLECTING) {
+      await bot.sendMessage(chatId, buildCollectingText(), getParticipantButton());
+      return;
+    }
+
+    if (state.giveaway.status === GIVEAWAY_STATUS.VOTING) {
+      await bot.sendMessage(chatId, buildVotingStartedText(), { parse_mode: "HTML" });
+      return;
+    }
+
+    await bot.sendMessage(chatId, buildNoGiveawayText(), { parse_mode: "HTML" });
+  }
+
+  async function registerParticipant(query) {
+    const chatId = query.message.chat.id;
+    const user = query.from;
+
+    if (state.giveaway.status !== GIVEAWAY_STATUS.COLLECTING) {
+      await bot.answerCallbackQuery(query.id, { text: "Сейчас нет активного набора." });
+      await bot.sendMessage(chatId, buildNoGiveawayText(), { parse_mode: "HTML" });
+      return;
+    }
+
+    const existing = state.giveaway.participants.find((participant) => participant.id === user.id);
+    if (existing) {
+      await bot.answerCallbackQuery(query.id, { text: "Ты уже участвуешь." });
+      await bot.editMessageText(buildAlreadyJoinedText(), {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        parse_mode: "HTML"
+      }).catch(() => null);
+      return;
+    }
+
+    if (state.giveaway.participants.length >= state.giveaway.participantsLimit) {
+      await bot.answerCallbackQuery(query.id, { text: "Набор уже завершен." });
+      await bot.sendMessage(chatId, buildVotingStartedText(), { parse_mode: "HTML" });
+      return;
+    }
+
+    const displayName = getParticipantTag(user);
+    const pollLabel = user.username ? `@${user.username}`.slice(0, 99) : displayName.slice(0, 99);
+
+    state.giveaway.participants.push({
+      id: user.id,
+      index: state.giveaway.participants.length,
+      displayName,
+      pollLabel,
+      user: {
+        id: user.id,
+        username: user.username || "",
+        first_name: user.first_name || "",
+        last_name: user.last_name || ""
       }
     });
-  }
-}
+    await saveState();
 
-async function handleUserStart(chatId) {
-  if (state.giveaway.status === GIVEAWAY_STATUS.COLLECTING) {
-    await bot.sendMessage(chatId, buildCollectingText(), getParticipantButton());
-    return;
-  }
-
-  if (state.giveaway.status === GIVEAWAY_STATUS.VOTING) {
-    await bot.sendMessage(chatId, buildVotingStartedText(), { parse_mode: "HTML" });
-    return;
-  }
-
-  await bot.sendMessage(chatId, buildNoGiveawayText(), { parse_mode: "HTML" });
-}
-
-async function registerParticipant(query) {
-  const chatId = query.message.chat.id;
-  const user = query.from;
-
-  if (state.giveaway.status !== GIVEAWAY_STATUS.COLLECTING) {
-    await bot.answerCallbackQuery(query.id, { text: "Сейчас нет активного набора." });
-    await bot.sendMessage(chatId, buildNoGiveawayText(), { parse_mode: "HTML" });
-    return;
-  }
-
-  const existing = state.giveaway.participants.find((participant) => participant.id === user.id);
-  if (existing) {
-    await bot.answerCallbackQuery(query.id, { text: "Ты уже участвуешь." });
-    await bot.editMessageText(buildAlreadyJoinedText(), {
+    await bot.answerCallbackQuery(query.id, { text: "Ты добавлен в список участников." });
+    await bot.editMessageText(buildJoinedText(), {
       chat_id: chatId,
       message_id: query.message.message_id,
       parse_mode: "HTML"
     }).catch(() => null);
-    return;
-  }
 
-  if (state.giveaway.participants.length >= state.giveaway.participantsLimit) {
-    await bot.answerCallbackQuery(query.id, { text: "Набор уже завершен." });
-    await bot.sendMessage(chatId, buildVotingStartedText(), { parse_mode: "HTML" });
-    return;
-  }
-
-  const displayName = getParticipantTag(user);
-  const pollLabel = user.username
-    ? `@${user.username}`.slice(0, 99)
-    : displayName.slice(0, 99);
-
-  state.giveaway.participants.push({
-    id: user.id,
-    index: state.giveaway.participants.length,
-    displayName,
-    pollLabel,
-    user: {
-      id: user.id,
-      username: user.username || "",
-      first_name: user.first_name || "",
-      last_name: user.last_name || ""
-    }
-  });
-  saveState(state);
-
-  await bot.answerCallbackQuery(query.id, { text: "Ты добавлен в список участников." });
-  await bot.editMessageText(buildJoinedText(), {
-    chat_id: chatId,
-    message_id: query.message.message_id,
-    parse_mode: "HTML"
-  }).catch(() => null);
-
-  await bot.sendMessage(
-    ADMIN_ID,
-    `Новый участник: ${displayName}\nСобрано: ${state.giveaway.participants.length}/${state.giveaway.participantsLimit}`,
-    { parse_mode: "HTML" }
-  ).catch(() => null);
-
-  if (state.giveaway.participants.length === state.giveaway.participantsLimit) {
     await bot.sendMessage(
       ADMIN_ID,
-      "Собрано 10 участников. Запускаю голосование автоматически.",
-      getAdminKeyboard()
+      `Новый участник: ${displayName}\nСобрано: ${state.giveaway.participants.length}/${state.giveaway.participantsLimit}`,
+      { parse_mode: "HTML" }
     ).catch(() => null);
 
-    await launchVoting(ADMIN_ID);
+    if (state.giveaway.participants.length === state.giveaway.participantsLimit) {
+      await bot.sendMessage(
+        ADMIN_ID,
+        "Собрано 10 участников. Запускаю голосование автоматически.",
+        getAdminKeyboard()
+      ).catch(() => null);
+
+      await launchVoting(ADMIN_ID);
+    }
   }
+
+  bot.onText(/^\/start$/, async (msg) => {
+    try {
+      if (isAdmin(msg.chat.id)) {
+        await handleAdminMessage(msg);
+        return;
+      }
+
+      await handleUserStart(msg.chat.id);
+    } catch (error) {
+      console.error("Start handler error:", error);
+    }
+  });
+
+  bot.on("message", async (msg) => {
+    try {
+      if (!msg.text || msg.text.startsWith("/")) {
+        return;
+      }
+
+      if (!isAdmin(msg.chat.id)) {
+        return;
+      }
+
+      await handleAdminMessage(msg);
+    } catch (error) {
+      console.error("Message handler error:", error);
+    }
+  });
+
+  bot.on("callback_query", async (query) => {
+    try {
+      const action = query.data;
+      const chatId = query.message.chat.id;
+
+      if (action === "admin_create_giveaway" && isAdmin(chatId)) {
+        if (state.giveaway.status === GIVEAWAY_STATUS.COLLECTING || state.giveaway.status === GIVEAWAY_STATUS.VOTING) {
+          await bot.answerCallbackQuery(query.id, { text: "Сначала заверши текущий розыгрыш." });
+          return;
+        }
+
+        resetGiveaway();
+        state.adminFlow = { step: ADMIN_FLOW.WAIT_END_AT, draft: null };
+        await saveState();
+
+        await bot.answerCallbackQuery(query.id);
+        await bot.sendMessage(chatId, "Напиши, когда закончится розыгрыш. Например: 30.03.2026 20:00");
+        return;
+      }
+
+      if (action === "admin_confirm_giveaway" && isAdmin(chatId)) {
+        if (state.adminFlow.step !== ADMIN_FLOW.WAIT_CONFIRM || !state.adminFlow.draft) {
+          await bot.answerCallbackQuery(query.id, { text: "Черновик розыгрыша не найден." });
+          return;
+        }
+
+        await bot.answerCallbackQuery(query.id, { text: "Публикую..." });
+        await startGiveawayAnnouncement(chatId);
+        return;
+      }
+
+      if (action === "admin_cancel_giveaway" && isAdmin(chatId)) {
+        resetAdminFlow();
+        await saveState();
+        await bot.answerCallbackQuery(query.id, { text: "Создание отменено." });
+        await sendAdminHome(chatId);
+        return;
+      }
+
+      if (action === "admin_launch_vote" && isAdmin(chatId)) {
+        await bot.answerCallbackQuery(query.id, { text: "Проверяю участников..." });
+        await launchVoting(chatId);
+        return;
+      }
+
+      if (action === "join_giveaway") {
+        await registerParticipant(query);
+      }
+    } catch (error) {
+      console.error("Callback handler error:", error);
+    }
+  });
+
+  bot.on("poll", async (poll) => {
+    try {
+      if (!poll.is_closed) {
+        return;
+      }
+
+      await finalizeVotingResult(poll);
+    } catch (error) {
+      console.error("Poll handler error:", error);
+    }
+  });
+
+  bot.on("polling_error", (error) => {
+    console.error("Polling error:", error.message);
+  });
+
+  scheduleVotingFinish();
+
+  console.log(`Bot is running with ${storage.mode} storage...`);
 }
 
-bot.onText(/^\/start$/, async (msg) => {
-  if (isAdmin(msg.chat.id)) {
-    await handleAdminMessage(msg);
-    return;
-  }
-
-  await handleUserStart(msg.chat.id);
+main().catch((error) => {
+  console.error("Fatal startup error:", error);
+  process.exit(1);
 });
-
-bot.on("message", async (msg) => {
-  if (!msg.text || msg.text.startsWith("/")) {
-    return;
-  }
-
-  if (!isAdmin(msg.chat.id)) {
-    return;
-  }
-
-  await handleAdminMessage(msg);
-});
-
-bot.on("callback_query", async (query) => {
-  const action = query.data;
-  const chatId = query.message.chat.id;
-
-  if (action === "admin_create_giveaway" && isAdmin(chatId)) {
-    if (state.giveaway.status === GIVEAWAY_STATUS.COLLECTING || state.giveaway.status === GIVEAWAY_STATUS.VOTING) {
-      await bot.answerCallbackQuery(query.id, { text: "Сначала заверши текущий розыгрыш." });
-      return;
-    }
-
-    resetGiveaway();
-    state.adminFlow = { step: ADMIN_FLOW.WAIT_END_AT, draft: null };
-    saveState(state);
-
-    await bot.answerCallbackQuery(query.id);
-    await bot.sendMessage(chatId, "Напиши, когда закончится набор участников. Например: 30.03.2026 20:00");
-    return;
-  }
-
-  if (action === "admin_confirm_giveaway" && isAdmin(chatId)) {
-    if (state.adminFlow.step !== ADMIN_FLOW.WAIT_CONFIRM || !state.adminFlow.draft) {
-      await bot.answerCallbackQuery(query.id, { text: "Черновик розыгрыша не найден." });
-      return;
-    }
-
-    await bot.answerCallbackQuery(query.id, { text: "Публикую..." });
-    await startGiveawayAnnouncement(chatId);
-    return;
-  }
-
-  if (action === "admin_cancel_giveaway" && isAdmin(chatId)) {
-    resetAdminFlow();
-    saveState(state);
-    await bot.answerCallbackQuery(query.id, { text: "Создание отменено." });
-    await sendAdminHome(chatId);
-    return;
-  }
-
-  if (action === "admin_launch_vote" && isAdmin(chatId)) {
-    await bot.answerCallbackQuery(query.id, { text: "Проверяю участников..." });
-    await launchVoting(chatId);
-    return;
-  }
-
-  if (action === "join_giveaway") {
-    await registerParticipant(query);
-  }
-});
-
-bot.on("poll", async (poll) => {
-  if (!poll.is_closed) {
-    return;
-  }
-
-  await finalizeVotingResult(poll);
-});
-
-bot.on("polling_error", (error) => {
-  console.error("Polling error:", error.message);
-});
-
-scheduleVotingFinish();
-
-console.log("Bot is running...");
