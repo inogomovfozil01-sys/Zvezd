@@ -407,7 +407,12 @@ async function main() {
     state.giveaway.prizeStars = state.adminFlow.draft.prizeStars;
     await saveState();
 
-    const sent = await bot.sendMessage(CHANNEL_ID, buildAnnouncementText(), { parse_mode: "HTML" });
+    const sent = await bot.sendMessage(CHANNEL_ID, buildAnnouncementText(), {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "Перейти в бота", url: "https://t.me/zvezdbest_bot" }]]
+      }
+    });
     state.giveaway.announcementMessageId = sent.message_id;
     resetAdminFlow();
     await saveState();
