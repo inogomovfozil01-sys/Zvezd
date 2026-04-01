@@ -215,6 +215,53 @@ function getMentionLink(user) {
   return `<a href="tg://user?id=${user.id}">${escapeHtml(title)}</a>`;
 }
 
+function sanitizeTelegramPath(value) {
+  if (!value) {
+    return value;
+  }
+
+  return String(value).replace(/\/bot[^/]+\//, "/bot<hidden>/");
+}
+
+function formatError(error, context = "") {
+  if (!error) {
+    return context ? `${context}: Unknown error` : "Unknown error";
+  }
+
+  const parts = [];
+
+  if (context) {
+    parts.push(context);
+  }
+
+  if (error.code) {
+    parts.push(`code=${error.code}`);
+  }
+
+  const response = error.response && typeof error.response === "object" ? error.response : null;
+  const body = response && response.body && typeof response.body === "object" ? response.body : null;
+
+  if (response && response.statusCode) {
+    parts.push(`status=${response.statusCode}`);
+  }
+
+  if (body && body.error_code) {
+    parts.push(`telegram_code=${body.error_code}`);
+  }
+
+  if (body && body.description) {
+    parts.push(body.description);
+  } else if (error.message) {
+    parts.push(error.message);
+  }
+
+  if (error.options && error.options.path) {
+    parts.push(`path=${sanitizeTelegramPath(error.options.path)}`);
+  }
+
+  return parts.join(" | ");
+}
+
 async function main() {
   const storage = createStorage();
   await storage.init();
@@ -540,10 +587,23 @@ async function main() {
     }
 
     const options = state.giveaway.participants.map((participant) => participant.pollLabel);
-    const poll = await bot.sendPoll(CHANNEL_ID, "Выберите участника розыгрыша", options, {
-      is_anonymous: false,
-      allows_multiple_answers: false
-    });
+    let poll;
+
+    try {
+      poll = await bot.sendPoll(CHANNEL_ID, "Выберите участника розыгрыша", options, {
+        is_anonymous: false,
+        allows_multiple_answers: false
+      });
+    } catch (error) {
+      console.error(
+        formatError(error, `sendPoll failed (channel=${CHANNEL_ID}, options=${options.length})`)
+      );
+      await bot.sendMessage(
+        chatId,
+        "Не удалось запустить голосование. Проверь права бота в канале и подробности в логе."
+      ).catch(() => null);
+      return;
+    }
 
     await bot.sendMessage(CHANNEL_ID, buildVotingText(state.giveaway.participants), {
       parse_mode: "HTML",
@@ -560,7 +620,6 @@ async function main() {
 
     await bot.sendMessage(chatId, "Голосование запущено и опубликовано в канале.");
   }
-
   async function handleAdminMessage(msg) {
     const chatId = msg.chat.id;
     const text = (msg.text || "").trim();
@@ -704,7 +763,7 @@ async function main() {
 
       await handleUserStart(msg.chat.id);
     } catch (error) {
-      console.error("Start handler error:", error);
+      console.error(formatError(error, "Start handler error"));
     }
   });
 
@@ -720,7 +779,7 @@ async function main() {
 
       await handleAdminMessage(msg);
     } catch (error) {
-      console.error("Message handler error:", error);
+      console.error(formatError(error, "Message handler error"));
     }
   });
 
@@ -773,7 +832,7 @@ async function main() {
         await registerParticipant(query);
       }
     } catch (error) {
-      console.error("Callback handler error:", error);
+      console.error(formatError(error, "Callback handler error"));
     }
   });
 
@@ -785,12 +844,12 @@ async function main() {
 
       await finalizeVotingResult(poll);
     } catch (error) {
-      console.error("Poll handler error:", error);
+      console.error(formatError(error, "Poll handler error"));
     }
   });
 
   bot.on("polling_error", (error) => {
-    console.error("Polling error:", error.message);
+    console.error(formatError(error, "Polling error"));
   });
 
   scheduleVotingFinish();
@@ -799,6 +858,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error("Fatal startup error:", error);
+  console.error(formatError(error, "Fatal startup error"));
   process.exit(1);
 });
