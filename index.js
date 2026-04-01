@@ -591,7 +591,7 @@ async function main() {
 
     try {
       poll = await bot.sendPoll(CHANNEL_ID, "Выберите участника розыгрыша", options, {
-        is_anonymous: false,
+        is_anonymous: true,
         allows_multiple_answers: false
       });
     } catch (error) {
