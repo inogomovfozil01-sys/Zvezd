@@ -365,28 +365,18 @@ async function main() {
     ].join("\n");
   }
 
-  function buildVotingText(participants) {
-    const lines = [
-      "<b>Дорогие друзья, стартует голосование!</b>",
+  function buildVotingText() {
+    return [
+      "\u0414\u043e\u0440\u043e\u0433\u0438\u0435 \u0434\u0440\u0443\u0437\u044c\u044f, \u0441\u0442\u0430\u0440\u0442\u0443\u0435\u0442 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0430\u043d\u0438\u0435!",
       "",
-      "Ниже участники текущего розыгрыша. Вы можете проголосовать за того, кого хотите поддержать.",
+      "\u041d\u0438\u0436\u0435 \u0443\u0447\u0430\u0441\u0442\u043d\u0438\u043a\u0438 \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u0440\u043e\u0437\u044b\u0433\u0440\u044b\u0448\u0430. \u0412\u044b \u043c\u043e\u0436\u0435\u0442\u0435 \u043f\u0440\u043e\u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0430\u0442\u044c \u0437\u0430 \u0442\u043e\u0433\u043e, \u043a\u043e\u0433\u043e \u0445\u043e\u0442\u0438\u0442\u0435 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0430\u0442\u044c.",
       "",
-      "<b>Участники:</b>"
-    ];
-
-    participants.forEach((participant, index) => {
-      lines.push(`${index + 1}. ${escapeHtml(participant.displayName)}`);
-    });
-
-    lines.push("");
-    lines.push(`Голосовать: <a href="${escapeHtml(VOTE_URL)}">${escapeHtml(VOTE_URL)}</a>`);
-    lines.push(`Бот: ${escapeHtml(BOT_USERNAME)}`);
-    lines.push(`<b>Администратор:</b> <code>${ADMIN_ID}</code>`);
-    lines.push(`<b>Окончание голосования:</b> ${escapeHtml(state.giveaway.endAtText)}`);
-
-    return lines.join("\n");
+      `\u0413\u043e\u043b\u043e\u0441\u043e\u0432\u0430\u0442\u044c: ${VOTE_URL}`,
+      `\u0411\u043e\u0442: ${BOT_USERNAME}`,
+      `\u0410\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u0440\u0430\u0442\u043e\u0440: ${ADMIN_ID}`,
+      `\u041e\u043a\u043e\u043d\u0447\u0430\u043d\u0438\u0435 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0430\u043d\u0438\u044f: ${state.giveaway.pollEndAtText || state.giveaway.endAtText}`
+    ].join("\n");
   }
-
   function buildWinnerText(winner) {
     return [
       "<b>Розыгрыш завершен!</b>",
@@ -604,11 +594,6 @@ async function main() {
       ).catch(() => null);
       return;
     }
-
-    await bot.sendMessage(CHANNEL_ID, buildVotingText(state.giveaway.participants), {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
     await notifyParticipantsVotingStarted();
 
     state.giveaway.status = GIVEAWAY_STATUS.VOTING;
